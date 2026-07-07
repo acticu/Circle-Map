@@ -151,7 +151,7 @@ class EccDNAGraphSolver:
         # Construct sparse adjacency matrix
         self.adj_matrix = csr_matrix((data, (row_inds, col_inds)), shape=(n_nodes, n_nodes))
         
-    def detect_cycles(self) -> pd.DataFrame:
+    def detect_cycles(self, bam_path: Optional[str] = None) -> pd.DataFrame:
         """
         Detect ecDNA circular structures using Strongly Connected Components (SCC) algorithm.
         
@@ -160,12 +160,23 @@ class EccDNAGraphSolver:
         - Single-node SCCs with high self-loop weights indicate single-segment circles
         - Multi-node SCCs indicate multi-segment circles (complex ecDNA with multiple genomic regions)
         
+        If a BAM file path is provided, advanced confidence scoring is performed including:
+        - Read continuity analysis across the circular structure
+        - Sequencing depth ratio between ecDNA region and flanking linear regions
+        
+        Args:
+            bam_path (Optional[str]): Path to sorted, indexed BAM file for advanced scoring.
+                                     If None, uses basic confidence from graph structure only.
+        
         Returns:
             pd.DataFrame: DataFrame containing detected circles with the following columns:
                 - 'type': 'Single-Segment' or 'Multi-Segment'
                 - 'segment_count': Number of distinct genomic segments in the circle
                 - 'nodes': String representation of node list [(chr, pos), ...]
                 - 'confidence': Mean edge weight in the component (0.0-1.0)
+                - 'continuity_score': Fraction of reads spanning the circle (if BAM provided)
+                - 'depth_ratio': Coverage ratio inside/outside ecDNA (if BAM provided)
+                - 'integrated_confidence': Combined confidence score (if BAM provided)
                 
         Note:
             Single-segment circles with confidence < 0.9 are filtered out as low-confidence.
@@ -173,7 +184,7 @@ class EccDNAGraphSolver:
         Example:
             >>> solver = EccDNAGraphSolver()
             >>> # After building graph with build_graph()
-            >>> circles = solver.detect_cycles()
+            >>> circles = solver.detect_cycles(bam_path="sample.bam")
             >>> circles.empty  # True if no circles detected
             False
         """
@@ -211,13 +222,68 @@ class EccDNAGraphSolver:
             # Single-segment circles require strong evidence (high posterior probability)
             if circle_type == 'Single-Segment' and conf < 0.9:
                 continue
-                
-            circles.append({
+            
+            circle_dict = {
                 'type': circle_type,
                 'segment_count': len(nodes),
                 'nodes': str(nodes),  # Store as string for CSV compatibility
                 'confidence': conf
-            })
+            }
+            
+            # If BAM path provided, perform advanced confidence scoring
+            if bam_path is not None:
+                try:
+                    from confidence_scorer import EccDNAConfidenceScorer
+                    
+                    # Convert nodes to segment format: [(chr, start, end), ...]
+                    # For junction-based detection, each node is a breakpoint
+                    # We need to infer segments from consecutive breakpoints
+                    segments = []
+                    sorted_nodes = sorted(nodes, key=lambda x: (x[0], x[1]))
+                    
+                    if len(sorted_nodes) == 1:
+                        # Single-segment: estimate segment from junction position
+                        chrom, pos = sorted_nodes[0]
+                        # Estimate segment boundaries (will be refined by continuity scorer)
+                        segments = [(chrom, max(0, pos - 500), pos + 500)]
+                    else:
+                        # Multi-segment: create segments between consecutive breakpoints
+                        for j in range(len(sorted_nodes)):
+                            chrom1, pos1 = sorted_nodes[j]
+                            chrom2, pos2 = sorted_nodes[(j + 1) % len(sorted_nodes)]
+                            
+                            if chrom1 == chrom2:
+                                # Same chromosome: segment between breakpoints
+                                segments.append((chrom1, min(pos1, pos2), max(pos1, pos2)))
+                            else:
+                                # Different chromosomes: treat as separate segments
+                                segments.append((chrom1, pos1, pos1 + 100))
+                                segments.append((chrom2, pos2, pos2 + 100))
+                    
+                    scorer = EccDNAConfidenceScorer(bam_path)
+                    candidate = scorer.score_circle(
+                        segments=segments,
+                        junctions_df=pd.DataFrame([{
+                            'chr': n[0], 'pos': n[1], 
+                            'posterior_prob': conf, 'is_valid': True
+                        } for n in nodes]),
+                        discordant_df=pd.DataFrame(),  # Already incorporated in graph
+                        circle_id=f"circle_{i}"
+                    )
+                    
+                    circle_dict['continuity_score'] = candidate.continuity_score
+                    circle_dict['depth_ratio'] = candidate.depth_ratio
+                    circle_dict['integrated_confidence'] = candidate.integrated_confidence
+                    
+                    scorer.close()
+                    
+                except Exception as e:
+                    # Fall back to basic scoring if advanced scoring fails
+                    circle_dict['continuity_score'] = None
+                    circle_dict['depth_ratio'] = None
+                    circle_dict['integrated_confidence'] = None
+            
+            circles.append(circle_dict)
                 
         return pd.DataFrame(circles)
 
