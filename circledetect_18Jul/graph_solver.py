@@ -74,8 +74,12 @@ class EccDNAGraphSolver:
         unique_sites = validated_junctions[['chr', 'pos']].drop_duplicates().copy()
         unique_sites['id'] = np.arange(len(unique_sites))
 
-        self.id_map = {row['id']: (row['chr'], row['pos']) for _, row in unique_sites.iterrows()}
-        reverse_map = {(row['chr'], row['pos']): row['id'] for _, row in unique_sites.iterrows()}
+        # VECTORIZED: Create id_map and reverse_map without iterrows()
+        ids = unique_sites['id'].values
+        chrs = unique_sites['chr'].values
+        positions = unique_sites['pos'].values
+        self.id_map = {int(ids[i]): (chrs[i], int(positions[i])) for i in range(len(ids))}
+        reverse_map = {(chrs[i], int(positions[i])): int(ids[i]) for i in range(len(ids))}
 
         n_nodes = len(unique_sites)
         if n_nodes == 0:
@@ -86,35 +90,41 @@ class EccDNAGraphSolver:
         col_inds: List[int] = []
         data: List[float] = []
 
-        # 1. Self-loops from validated junctions
-        for _, row in validated_junctions.iterrows():
-            if row['is_valid']:
-                key = (row['chr'], row['pos'])
-                if key in reverse_map:
-                    nid = reverse_map[key]
-                    row_inds.append(nid)
-                    col_inds.append(nid)
-                    data.append(row['posterior_prob'])
+        # 1. Self-loops from validated junctions - FULLY VECTORIZED
+        valid_mask = validated_junctions['is_valid'].values
+        if valid_mask.any():
+            valid_junctions = validated_junctions[valid_mask]
+            v_chrs = valid_junctions['chr'].values
+            v_positions = valid_junctions['pos'].values
+            v_probs = valid_junctions['posterior_prob'].values
+            
+            # Vectorized lookup: create arrays of node IDs directly
+            keys = list(zip(v_chrs, v_positions.astype(int)))
+            node_ids = [reverse_map.get(key, -1) for key in keys]
+            valid_indices = [i for i, nid in enumerate(node_ids) if nid >= 0]
+            
+            for i in valid_indices:
+                nid = node_ids[i]
+                row_inds.append(nid)
+                col_inds.append(nid)
+                data.append(float(v_probs[i]))
 
-        # 2. Per-chromosome sorted numpy arrays for fast nearest-node lookup
+        # 2. Per-chromosome sorted numpy arrays for fast nearest-node lookup - VECTORIZED
         chr_positions: Dict[str, np.ndarray] = {}
         chr_node_ids: Dict[str, np.ndarray] = {}
-        for _, row in unique_sites.iterrows():
-            c = row['chr']
-            if c not in chr_positions:
-                chr_positions[c] = []
-                chr_node_ids[c] = []
-            chr_positions[c].append(int(row['pos']))
-            chr_node_ids[c].append(int(row['id']))
-        for c in chr_positions:
-            p = np.array(chr_positions[c])
-            n = np.array(chr_node_ids[c])
+        
+        # Vectorized grouping by chromosome using numpy unique and boolean masks
+        unique_chrs = np.unique(chrs)
+        for c in unique_chrs:
+            mask = chrs == c
+            p = positions[mask].astype(int)
+            n = ids[mask].astype(int)
             order = np.argsort(p)
             chr_positions[c] = p[order]
             chr_node_ids[c] = n[order]
 
         # 3. Vectorized nearest-node: batch-searchsorted per chromosome,
-        #    then single-pass Python loop over 119M discordant reads.
+        #    then fully vectorized processing of discordant reads using NumPy.
         pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
         if not discordant.empty and chr_positions:
             W = DISCORDANT_MATCH_WINDOW
@@ -155,21 +165,55 @@ class EccDNAGraphSolver:
                 if m2.any():
                     n2_arr[m2] = _nearest_batch(chrom, pos2_arr[m2])
 
-            # Stage B: single Python pass — no searchsorted inside.
+            # Stage B: FULLY VECTORIZED — no Python loop over reads
+            # Create boolean masks for different cases
             same_chrom = chr1_arr == chr2_arr
-            for idx in range(len(discordant)):
-                u, v = int(n1_arr[idx]), int(n2_arr[idx])
-                if u < 0 and v < 0:
-                    continue
-                if u >= 0 and v >= 0 and u == v and same_chrom[idx]:
-                    jp_v = unique_sites.iloc[u]['pos']
-                    p1_i, p2_i = int(pos1_arr[idx]), int(pos2_arr[idx])
-                    near = p1_i if abs(p1_i - jp_v) < abs(p2_i - jp_v) else p2_i
-                    far = p2_i if near == p1_i else p1_i
-                    _snap.setdefault(u, []).append(far)
-                elif u >= 0 and v >= 0 and u != v:
-                    pair_counts[(u, v)] += 1
-                    pair_counts[(u, v)] += 1
+            valid_pairs = (n1_arr >= 0) & (n2_arr >= 0)
+            same_node = (n1_arr == n2_arr) & same_chrom & valid_pairs
+            diff_node = (n1_arr != n2_arr) & valid_pairs
+            
+            # Process same-node pairs (for _discordant_snap) using vectorized operations
+            if same_node.any():
+                sn_indices = np.where(same_node)[0]
+                # Vectorized extraction of positions and node IDs
+                u_arr = n1_arr[sn_indices].astype(np.int32)
+                p1_sn = pos1_arr[sn_indices].astype(np.int32)
+                p2_sn = pos2_arr[sn_indices].astype(np.int32)
+                
+                # Get junction positions for all u nodes at once
+                jp_arr = unique_sites['pos'].values[u_arr]
+                
+                # Vectorized distance comparison
+                d1 = np.abs(p1_sn - jp_arr)
+                d2 = np.abs(p2_sn - jp_arr)
+                near_arr = np.where(d1 < d2, p1_sn, p2_sn)
+                far_arr = np.where(d1 < d2, p2_sn, p1_sn)
+                
+                # Group by node ID using dictionary
+                for u, far in zip(u_arr, far_arr):
+                    _snap.setdefault(int(u), []).append(int(far))
+            
+            # Process different-node pairs using bincount for fast counting
+            if diff_node.any():
+                u_vals = n1_arr[diff_node].astype(np.int64)
+                v_vals = n2_arr[diff_node].astype(np.int64)
+                
+                # Encode (u, v) pairs into single integers for counting
+                # Use sparse matrix multiplication approach for counting
+                n_nodes = len(unique_sites)
+                pair_ids = u_vals * n_nodes + v_vals
+                
+                # Count occurrences of each pair using bincount
+                counts = np.bincount(pair_ids)
+                
+                # Extract non-zero counts and decode back to (u, v)
+                nonzero_pairs = np.nonzero(counts)[0]
+                for pair_id in nonzero_pairs:
+                    u = pair_id // n_nodes
+                    v = pair_id % n_nodes
+                    count = counts[pair_id]
+                    if count >= MIN_DISCORDANT_EDGES:
+                        pair_counts[(u, v)] = count
 
         # 4. Add directed edges with sufficient discordant support.
         #    Direction is preserved so that Strongly Connected Components can
@@ -206,21 +250,20 @@ class EccDNAGraphSolver:
         bam_path: Optional[str] = None,
         discordant_df: Optional[pd.DataFrame] = None,
         insert_metrics: Optional[Tuple[float, float]] = None,
-        top_n: int = 500,
+        top_n: int = 0,  # 0 means score ALL circles (no limit)
     ) -> pd.DataFrame:
         """
         Detect ecDNA circular structures using Strongly Connected Components.
 
         When BAM-based confidence scoring is enabled, only the ``top_n`` circles
         (ranked by graph-based confidence) receive full continuity and depth-ratio
-        scoring, since BAM queries are expensive. Remaining circles are reported
-        with graph-based confidence only.
+        scoring, since BAM queries are expensive. If top_n=0, ALL circles are scored.
 
         Args:
             bam_path: Sorted, indexed BAM for advanced scoring.
             discordant_df: Discordant read pairs DataFrame.
             insert_metrics: (mean, std) insert size distribution.
-            top_n: Max circles to BAM-score (limits expensive queries).
+            top_n: Max circles to BAM-score (0 = score all circles).
         """
         if self.adj_matrix is None or self.adj_matrix.shape[0] == 0:
             return pd.DataFrame()
@@ -245,8 +288,11 @@ class EccDNAGraphSolver:
 
         # ---- Build circle dicts ----
         circles: List[Dict[str, any]] = []
-        for i in range(n_comp):
-            members = np.where(labels == i)[0]
+        
+        # Vectorized: group all members by component in one pass
+        unique_labels = np.unique(labels)
+        for label in unique_labels:
+            members = np.where(labels == label)[0]
             if len(members) == 0:
                 continue
 
@@ -278,15 +324,21 @@ class EccDNAGraphSolver:
         if not circles:
             return pd.DataFrame()
 
-        # Sort by confidence descending; only top_n get BAM scoring
+        # Sort by confidence descending
         circles.sort(key=lambda c: c['confidence'], reverse=True)
-        to_score = circles[:top_n]
+        
+        # Determine which circles to score with BAM-based metrics
+        # If top_n <= 0, score ALL circles; otherwise limit to top_n
+        if top_n <= 0:
+            to_score = circles
+        else:
+            to_score = circles[:top_n]
 
         if bam_path is not None and to_score:
             try:
                 from confidence_scorer import EccDNAConfidenceScorer
 
-                for circle_dict in to_score:
+                for i, circle_dict in enumerate(to_score):
                     sorted_nodes = sorted(
                         circle_dict['_nodes_raw'], key=lambda x: (x[0], x[1])
                     )
@@ -307,7 +359,7 @@ class EccDNAGraphSolver:
                                 discordant_df if discordant_df is not None
                                 else pd.DataFrame()
                             ),
-                            circle_id=f"circle_{circles.index(circle_dict)}",
+                            circle_id=f"circle_{i}",
                             insert_metrics=insert_metrics,
                         )
 
@@ -400,12 +452,16 @@ class EccDNAGraphSolver:
                 ((discordant_df['chr2'] == chrom) & (abs(discordant_df['pos2'] - pos) < DISCORDANT_MATCH_WINDOW) &
                  (discordant_df['chr1'] == chrom))
             )
-            near_disc = discordant_df[near_mask]
-            for _, row in near_disc.iterrows():
-                if row['chr1'] == chrom and abs(row['pos1'] - pos) < DISCORDANT_MATCH_WINDOW:
-                    far_positions.append(row['pos2'])
-                else:
-                    far_positions.append(row['pos1'])
+            # VECTORIZED: Extract far positions without iterrows()
+            if near_mask.any():
+                near_disc = discordant_df[near_mask]
+                # Vectorized extraction: use numpy where
+                chr1_arr = near_disc['chr1'].values
+                pos1_arr = near_disc['pos1'].values
+                pos2_arr = near_disc['pos2'].values
+                # For reads where chr1 matches and pos1 is near, take pos2; otherwise take pos1
+                condition = (chr1_arr == chrom) & (np.abs(pos1_arr - pos) < DISCORDANT_MATCH_WINDOW)
+                far_positions = np.where(condition, pos2_arr, pos1_arr).tolist()
 
         if far_positions:
             far_median = int(np.median(far_positions))

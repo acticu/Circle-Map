@@ -96,6 +96,7 @@ def run_pipeline(
         bam_path=bam_path,
         discordant_df=discord_df,
         insert_metrics=insert_metrics,
+        top_n=0,  # Score ALL circles (no limit)
     )
 
     # 5. Output
