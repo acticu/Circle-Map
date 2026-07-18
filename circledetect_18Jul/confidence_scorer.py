@@ -529,21 +529,93 @@ class EccDNAConfidenceScorer:
         mean_junction_posterior = np.mean(junction_scores) if junction_scores else 0.0
 
         # Count discordant reads supporting connections between segments
-        discordant_count = 0
-        for _, row in discordant_df.iterrows():
-            chr1, pos1 = row['chr1'], row['pos1']
-            chr2, pos2 = row['chr2'], row['pos2']
-
-            # Check if both ends fall within any segment
-            in_segment1 = any(
-                (c == chr1 and s <= pos1 <= e) for c, s, e in segments
-            )
-            in_segment2 = any(
-                (c == chr2 and s <= pos2 <= e) for c, s, e in segments
-            )
-
-            if in_segment1 and in_segment2:
-                discordant_count += 1
+        # FULLY VECTORIZED: Use sparse matrix broadcasting for all circles at once
+        if discordant_df.empty or len(discordant_df) == 0 or len(segments) == 0:
+            discordant_count = 0
+        else:
+            # Extract segment boundaries as numpy arrays
+            seg_chroms = np.array([s[0] for s in segments])
+            seg_starts = np.array([s[1] for s in segments])
+            seg_ends = np.array([s[2] for s in segments])
+            
+            # Get discordant read positions as numpy arrays
+            d_chr1 = discordant_df['chr1'].values
+            d_pos1 = discordant_df['pos1'].values
+            d_chr2 = discordant_df['chr2'].values
+            d_pos2 = discordant_df['pos2'].values
+            
+            n_reads = len(discordant_df)
+            n_segs = len(segments)
+            
+            # OPTIMIZATION: Use broadcasting with int32 to reduce memory
+            # Create chromosome match masks first (cheapest operation)
+            discordant_count = 0
+            
+            # For small number of segments (< 100), use direct broadcasting
+            if n_segs < 100:
+                # Shape: (n_reads, n_segs) boolean arrays
+                # Process in chunks to avoid memory explosion
+                chunk_size = min(10000, n_reads)
+                for chunk_start in range(0, n_reads, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, n_reads)
+                    
+                    # Extract chunk
+                    c_chr1 = d_chr1[chunk_start:chunk_end]
+                    c_pos1 = d_pos1[chunk_start:chunk_end]
+                    c_chr2 = d_chr2[chunk_start:chunk_end]
+                    c_pos2 = d_pos2[chunk_start:chunk_end]
+                    c_n_reads = chunk_end - chunk_start
+                    
+                    # Vectorized chromosome matching
+                    in_seg1 = np.zeros((c_n_reads, n_segs), dtype=bool)
+                    in_seg2 = np.zeros((c_n_reads, n_segs), dtype=bool)
+                    
+                    for i in range(n_segs):
+                        chrom_i = seg_chroms[i]
+                        start_i = seg_starts[i]
+                        end_i = seg_ends[i]
+                        in_seg1[:, i] = (c_chr1 == chrom_i) & (c_pos1 >= start_i) & (c_pos1 <= end_i)
+                        in_seg2[:, i] = (c_chr2 == chrom_i) & (c_pos2 >= start_i) & (c_pos2 <= end_i)
+                    
+                    # A read counts if BOTH ends fall within ANY segment
+                    has_end1_in_seg = in_seg1.any(axis=1)
+                    has_end2_in_seg = in_seg2.any(axis=1)
+                    discordant_count += int((has_end1_in_seg & has_end2_in_seg).sum())
+            else:
+                # For many segments, use dictionary-based lookup (faster than large matrices)
+                # Create segment lookup: chrom -> list of (start, end, idx)
+                seg_lookup = {}
+                for i, (chrom, start, end) in enumerate(segments):
+                    if chrom not in seg_lookup:
+                        seg_lookup[chrom] = []
+                    seg_lookup[chrom].append((start, end, i))
+                
+                # Process each read
+                for idx in range(n_reads):
+                    chr1, pos1 = d_chr1[idx], d_pos1[idx]
+                    chr2, pos2 = d_chr2[idx], d_pos2[idx]
+                    
+                    # Check if end1 in any segment
+                    in_seg1 = False
+                    if chr1 in seg_lookup:
+                        for start, end, _ in seg_lookup[chr1]:
+                            if start <= pos1 <= end:
+                                in_seg1 = True
+                                break
+                    
+                    if not in_seg1:
+                        continue
+                    
+                    # Check if end2 in any segment
+                    in_seg2 = False
+                    if chr2 in seg_lookup:
+                        for start, end, _ in seg_lookup[chr2]:
+                            if start <= pos2 <= end:
+                                in_seg2 = True
+                                break
+                    
+                    if in_seg1 and in_seg2:
+                        discordant_count += 1
 
         # Calculate continuity score (insert metrics enable the bridging regime)
         continuity_score = self.calculate_continuity_score(segments, insert_metrics)
